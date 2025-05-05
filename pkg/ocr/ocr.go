@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"imageprocessor/pkg/cache"
+	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
@@ -18,7 +19,7 @@ var (
 	ErrOCRFailed = errors.New("OCR processing failed")
 
 	// Cache instance for OCR results
-	ocrCache *cache.Cache
+	ocrCache cache.Cache
 )
 
 // OCRConfig holds configuration for OCR processing
@@ -27,6 +28,7 @@ type OCRConfig struct {
 	ApplyPreprocess bool          // Whether to apply preprocessing
 	NumThreads      int           // Number of threads to use
 	DPI             int           // DPI for processing
+	UsePythonOCR    bool          // Whether to use Python OCR API
 }
 
 // DefaultOCRConfig returns a default OCR configuration optimized for most systems
@@ -36,12 +38,20 @@ func DefaultOCRConfig() OCRConfig {
 		ApplyPreprocess: true,           // Apply image preprocessing by default
 		NumThreads:      runtime.NumCPU(),
 		DPI:             300, // Higher DPI for better quality
+		UsePythonOCR:    false,
 	}
 }
 
-// InitCache initializes the OCR cache
+// InitCache initializes the OCR cache with in-memory storage
 func InitCache(ttl time.Duration) {
-	ocrCache = cache.NewCache(ttl)
+	ocrCache = cache.NewInMemoryCache(ttl)
+}
+
+// InitRedisCache initializes the OCR cache with Redis
+func InitRedisCache(redisURL string, ttl time.Duration) error {
+	var err error
+	ocrCache, err = cache.NewRedisCache(redisURL, ttl, "ocr")
+	return err
 }
 
 // ImageToText converts an image to text using Tesseract OCR
@@ -79,7 +89,7 @@ func ImageToTextWithConfig(imagePath string, config OCRConfig) (string, error) {
 	// Apply preprocessing if enabled
 	var processedImagePath string
 	if config.ApplyPreprocess {
-		processedImagePath, err = preprocessImage(imagePath)
+		processedImagePath, err = preprocessImageOpenCV(imagePath)
 		if err != nil {
 			log.Printf("Warning: Image preprocessing failed: %v, using original image", err)
 			processedImagePath = imagePath
@@ -98,9 +108,6 @@ func ImageToTextWithConfig(imagePath string, config OCRConfig) (string, error) {
 		"--oem", "1", // Use LSTM OCR Engine only
 		"--psm", "6", // Assume a single uniform block of text
 		"-c", fmt.Sprintf("tessedit_thread_count=%d", config.NumThreads),
-		"-c", fmt.Sprintf("tessdit_create_pdf=0"),
-		"-c", fmt.Sprintf("tessdit_create_hocr=0"),
-		"-c", fmt.Sprintf("tessdit_pageseg_mode=6"),
 	}
 
 	// Add DPI parameter if specified
@@ -120,46 +127,75 @@ func ImageToTextWithConfig(imagePath string, config OCRConfig) (string, error) {
 
 	// Store in cache if we have a hash
 	if imageHash != "" {
-		ocrCache.Set(imageHash, text)
+		if err := ocrCache.Set(imageHash, text); err != nil {
+			log.Printf("Warning: Failed to cache OCR result: %v", err)
+		}
 	}
 
 	return text, nil
 }
 
-// preprocessImage applies preprocessing filters to improve OCR results
+// preprocessImageOpenCV applies preprocessing filters using OpenCV
 // Returns path to processed image (temporary file)
-func preprocessImage(imagePath string) (string, error) {
+func preprocessImageOpenCV(imagePath string) (string, error) {
 	// Create temporary file for output
 	ext := filepath.Ext(imagePath)
-	tempFile, err := os.CreateTemp("", "ocr-preprocess-*"+ext)
+	tempFile, err := ioutil.TempFile("", "ocr-preprocess-*"+ext)
 	if err != nil {
 		return "", fmt.Errorf("failed to create temp file: %w", err)
 	}
 	tempFile.Close()
 	tempPath := tempFile.Name()
 
-	// Use ImageMagick for preprocessing - essential filters for OCR optimization
-	cmd := exec.Command(
-		"convert", imagePath,
-		"-respect-parenthesis",
-		"\\(",
-		"-clone", "0",
-		"-colorspace", "gray",
-		"-normalize",
-		"-blur", "0x1",
-		"-contrast-stretch", "0%",
-		"\\)",
-		"-compose", "over",
-		"-composite",
-		"-sharpen", "0x1",
-		"-black-threshold", "50%",
-		"-white-threshold", "50%",
-		"-resize", "200%",
-		"-define", "png:color-type=0",
-		"-define", "png:bit-depth=8",
-		tempPath,
-	)
+	// Preprocessing Python script
+	pythonScript := `
+import cv2
+import sys
+import numpy as np
 
+# Read image
+img = cv2.imread(sys.argv[1])
+if img is None:
+    sys.exit(1)
+
+# Convert to grayscale
+gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+# Apply Gaussian blur to reduce noise
+blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+# Apply thresholding
+_, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+# Apply adaptive thresholding as a second approach
+adaptive_thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                       cv2.THRESH_BINARY, 11, 2)
+
+# Combine both thresholding results
+combined = cv2.bitwise_or(thresh, adaptive_thresh)
+
+# Perform dilation to make text clearer
+kernel = np.ones((1, 1), np.uint8)
+dilated = cv2.dilate(combined, kernel, iterations=1)
+
+# Save the processed image
+cv2.imwrite(sys.argv[2], dilated)
+`
+
+	// Write script to temp file
+	scriptFile, err := ioutil.TempFile("", "ocr-script-*.py")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp script file: %w", err)
+	}
+	defer os.Remove(scriptFile.Name())
+
+	if _, err := scriptFile.WriteString(pythonScript); err != nil {
+		return "", fmt.Errorf("failed to write script: %w", err)
+	}
+	scriptFile.Close()
+
+	// Run Python script
+	cmd := exec.Command("python3", scriptFile.Name(), imagePath, tempPath)
 	if err := cmd.Run(); err != nil {
 		os.Remove(tempPath) // Clean up on error
 		return "", fmt.Errorf("image preprocessing failed: %w", err)
@@ -173,7 +209,8 @@ func GetCacheSize() int {
 	if ocrCache == nil {
 		return 0
 	}
-	return ocrCache.Size()
+	size, _ := ocrCache.Size()
+	return size
 }
 
 // ClearCache clears the OCR cache

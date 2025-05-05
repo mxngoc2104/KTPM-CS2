@@ -18,7 +18,7 @@ var (
 	ErrTranslationFailed = errors.New("translation failed")
 
 	// Cache instance for translation results
-	translationCache *cache.TranslationCache
+	translationCache cache.Cache
 )
 
 // TranslationConfig holds configuration for the translator
@@ -39,9 +39,16 @@ func DefaultTranslationConfig() TranslationConfig {
 	}
 }
 
-// InitCache initializes the translation cache
+// InitCache initializes the translation cache with in-memory storage
 func InitCache(ttl time.Duration) {
-	translationCache = cache.NewTranslationCache(ttl)
+	translationCache = cache.NewInMemoryCache(ttl)
+}
+
+// InitRedisCache initializes the translation cache with Redis
+func InitRedisCache(redisURL string, ttl time.Duration) error {
+	var err error
+	translationCache, err = cache.NewRedisCache(redisURL, ttl, "translation")
+	return err
 }
 
 // Translate text from English to Vietnamese
@@ -91,7 +98,9 @@ func TranslateWithConfig(text string, config TranslationConfig) (string, error) 
 	}
 
 	// Store in cache
-	translationCache.Set(textHash, translatedText)
+	if err := translationCache.Set(textHash, translatedText); err != nil {
+		log.Printf("Warning: Failed to cache translation result: %v", err)
+	}
 
 	return translatedText, nil
 }
@@ -180,7 +189,8 @@ func GetCacheSize() int {
 	if translationCache == nil {
 		return 0
 	}
-	return translationCache.Size()
+	size, _ := translationCache.Size()
+	return size
 }
 
 // ClearCache clears the translation cache
