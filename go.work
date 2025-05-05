@@ -1,0 +1,14 @@
+go 1.24.2 // Or your Go version
+
+use (
+	./api
+	// ./pkg/cache // Tạm thời comment lại vì chưa tạo module cache
+	./pkg/imagefilter
+	// ./pkg/kafka // Tạm thời comment lại vì chưa tạo module kafka helper
+	./pkg/messaging // Thêm messaging module
+	./pkg/ocr
+	./pkg/pdf
+	./pkg/translator
+	./worker
+)
+ 
